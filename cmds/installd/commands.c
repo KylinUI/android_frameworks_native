@@ -18,6 +18,7 @@
 #include "installd.h"
 #include <diskusage/dirsize.h>
 #include <selinux/android.h>
+#include <unistd.h>
 
 /* Directory records that are used in execution of commands. */
 dir_rec_t android_data_dir;
@@ -1139,15 +1140,21 @@ int restorecon_data()
     return ret;
 }
 
-static void run_idmap(const char *target_apk, const char *overlay_apk, int idmap_fd, const char *redirectionsPath)
+static void run_idmap(const char *target_apk, const char *overlay_apk, int idmap_fd,
+                      uint32_t target_hash, uint32_t overlay_hash, const char *redirectionsPath)
 {
     static const char *IDMAP_BIN = "/system/bin/idmap";
     static const size_t MAX_INT_LEN = 32;
     char idmap_str[MAX_INT_LEN];
+    char target_hash_str[MAX_INT_LEN];
+    char overlay_hash_str[MAX_INT_LEN];
 
     snprintf(idmap_str, sizeof(idmap_str), "%d", idmap_fd);
+    snprintf(target_hash_str, sizeof(target_hash_str), "%d", target_hash);
+    snprintf(overlay_hash_str, sizeof(overlay_hash_str), "%d", overlay_hash);
 
-    execl(IDMAP_BIN, IDMAP_BIN, "--fd", target_apk, overlay_apk, idmap_str, redirectionsPath, (char*)NULL);
+    execl(IDMAP_BIN, IDMAP_BIN, "--fd", target_apk, overlay_apk, idmap_str,
+            target_hash_str, overlay_hash_str, redirectionsPath, (char*)NULL);
     ALOGE("execl(%s) failed: %s\n", IDMAP_BIN, strerror(errno));
 }
 
@@ -1195,7 +1202,8 @@ static int flatten_path(const char *prefix, const char *suffix,
     return 0;
 }
 
-int idmap(const char *target_apk, const char *overlay_apk, uid_t uid, const char *redirections)
+int idmap(const char *target_apk, const char *overlay_apk, uid_t uid,
+          uint32_t target_hash, uint32_t overlay_hash, const char *redirections)
 {
     ALOGV("idmap target_apk=%s overlay_apk=%s uid=%d\n", target_apk, overlay_apk, uid);
 
@@ -1240,7 +1248,7 @@ int idmap(const char *target_apk, const char *overlay_apk, uid_t uid, const char
             exit(1);
         }
 
-        run_idmap(target_apk, overlay_apk, idmap_fd, redirections);
+        run_idmap(target_apk, overlay_apk, idmap_fd, target_hash, overlay_hash, redirections);
         exit(1); /* only if exec call to idmap failed */
     } else {
         int status = wait_child(pid);
@@ -1260,7 +1268,8 @@ fail:
     return -1;
 }
 
-static void run_aapt(const char *source_apk, const char *internal_path, int restable_fd, int resapk_fd, int pkgId)
+static void run_aapt(const char *source_apk, const char *internal_path, int restable_fd,
+                     int resapk_fd, int pkgId, const char *common_res_path)
 {
     static const char *AAPT_BIN = "/system/bin/aapt";
     static const char *MANIFEST = "/data/app/AndroidManifest.xml";
@@ -1274,8 +1283,21 @@ static void run_aapt(const char *source_apk, const char *internal_path, int rest
     snprintf(restable_str, sizeof(restable_str), "%d", restable_fd);
     snprintf(resapk_str, sizeof(resapk_str), "%d", resapk_fd);
     snprintf(pkgId_str, sizeof(pkgId_str), "%d", pkgId);
+    bool hasCommonResources = (common_res_path != NULL && common_res_path[0] != '\0');
 
-    execl(AAPT_BIN, AAPT_BIN, "package",
+    if (hasCommonResources) {
+        execl(AAPT_BIN, AAPT_BIN, "package",
+                              "-M", MANIFEST,
+                              "-S", source_apk,
+                              "-X", internal_path,
+                              "-R", restable_str,
+                              "-I", FRAMEWORK_RES,
+                              "-I", common_res_path,
+                              "-r", resapk_str,
+                              "-x", pkgId_str,
+                              (char*)NULL);
+    } else {
+        execl(AAPT_BIN, AAPT_BIN, "package",
                               "-M", MANIFEST,
                               "-S", source_apk,
                               "-X", internal_path,
@@ -1284,13 +1306,18 @@ static void run_aapt(const char *source_apk, const char *internal_path, int rest
                               "-r", resapk_str,
                               "-x", pkgId_str,
                               (char*)NULL);
+    }
     ALOGE("execl(%s) failed: %s\n", AAPT_BIN, strerror(errno));
 }
 
-int aapt(const char *source_apk, const char *internal_path, const char *out_restable, uid_t uid, int pkgId)
+int aapt(const char *source_apk, const char *internal_path, const char *out_restable, uid_t uid,
+         int pkgId, const char *common_res_path)
 {
-    ALOGD("aapt source_apk=%s internal_path=%s out_restable=%s uid=%d, pkgId=%d\n",
-             source_apk, internal_path, out_restable, uid, pkgId);
+    ALOGD("aapt source_apk=%s internal_path=%s out_restable=%s uid=%d, pkgId=%d, common_res_path=%s",
+             source_apk, internal_path, out_restable, uid, pkgId, common_res_path);
+    static const int PARENT_READ_PIPE = 0;
+    static const int CHILD_WRITE_PIPE = 1;
+
     int restable_fd = -1;
     int resapk_fd = -1;
     char restable_path[PATH_MAX];
@@ -1330,8 +1357,11 @@ int aapt(const char *source_apk, const char *internal_path, const char *out_rest
         goto fail;
     }
 
-    pid_t pid;
-    pid = fork();
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        pipefd[0] = pipefd[1] = -1;
+    }
+    pid_t pid = fork();
     if (pid == 0) {
         /* child -- drop privileges before continuing */
         if (setgid(uid) != 0) {
@@ -1353,10 +1383,47 @@ int aapt(const char *source_apk, const char *internal_path, const char *out_rest
             exit(1);
         }
 
-        run_aapt(source_apk, internal_path, restable_fd, resapk_fd, pkgId);
+        if (pipefd[PARENT_READ_PIPE] > 0 && pipefd[CHILD_WRITE_PIPE] > 0) {
+            close(pipefd[PARENT_READ_PIPE]); // close unused read end
+            if (dup2(pipefd[CHILD_WRITE_PIPE], STDERR_FILENO) != STDERR_FILENO) {
+                pipefd[CHILD_WRITE_PIPE] = -1;
+            }
+        }
+
+        run_aapt(source_apk, internal_path, restable_fd, resapk_fd, pkgId, common_res_path);
+
+        if (pipefd[CHILD_WRITE_PIPE] > 0) {
+            close(pipefd[CHILD_WRITE_PIPE]);
+        }
         exit(1); /* only if exec call to idmap failed */
     } else {
-        int status = wait_child(pid);
+        int status, i;
+        char buffer[1024];
+        ssize_t readlen;
+
+        if (pipefd[CHILD_WRITE_PIPE] > 0) {
+            close(pipefd[CHILD_WRITE_PIPE]); // close unused write end
+        }
+
+        if (pipefd[PARENT_READ_PIPE] > 0) {
+            while ((readlen = read(pipefd[PARENT_READ_PIPE], buffer, sizeof(buffer) - 1)) > 0) {
+                // in case buffer has more than one string in it, replace '\0' with '\n'
+                for (i = 0; i < readlen; i++) {
+                    if (buffer[i] == '\0') buffer[i] = '\n';
+                }
+                // null terminate buffer at readlen
+                buffer[readlen] = '\0';
+                ALOG(LOG_ERROR, "InstallTheme", "%s", buffer);
+            }
+            waitpid(pid, &status, 0);
+
+            if (pipefd[PARENT_READ_PIPE] > 0) {
+                close(pipefd[PARENT_READ_PIPE]);
+            }
+        } else {
+            status = wait_child(pid);
+        }
+
         if (status != 0) {
             ALOGE("aapt failed, status=0x%04x\n", status);
             goto fail;

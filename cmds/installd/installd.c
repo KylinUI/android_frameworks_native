@@ -130,12 +130,12 @@ static int do_restorecon_data(char **arg __attribute__((unused)),
 
 static int do_idmap(char **arg, char reply[REPLY_MAX])
 {
-    return idmap(arg[0], arg[1], atoi(arg[2]), arg[3]);
+    return idmap(arg[0], arg[1], atoi(arg[2]), atoi(arg[3]), atoi(arg[4]), arg[5]);
 }
 
 static int do_aapt(char **arg, char reply[REPLY_MAX])
 {
-    return aapt(arg[0], arg[1], arg[2], atoi(arg[3]), atoi(arg[4]));
+    return aapt(arg[0], arg[1], arg[2], atoi(arg[3]), atoi(arg[4]), arg[5]);
 }
 
 struct cmdinfo {
@@ -162,8 +162,8 @@ struct cmdinfo cmds[] = {
     { "mkuserdata",           4, do_mk_user_data },
     { "rmuser",               1, do_rm_user },
     { "restorecondata",       0, do_restorecon_data },
-    { "idmap",                4, do_idmap },
-    { "aapt",                 5, do_aapt },
+    { "idmap",                6, do_idmap },
+    { "aapt",                 6, do_aapt },
 };
 
 char write_error = 0;
